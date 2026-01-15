@@ -20,7 +20,7 @@ This project focuses on:
 
 ## Tech (tentative)
 - Frontend: React + Vite
-- Backend: Node / API routes
+- Backend: Python
 - Data: NBA play-by-play data
 - Summaries: rule-based signals + LLM assistance
 - Storage: lightweight DB for caching

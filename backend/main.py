@@ -1,8 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel
+import json
+from pathlib import Path
+from nba_api.live.nba.endpoints import scoreboard, boxscore
 
 app = FastAPI(title="NBA Game Recaps API")
 
@@ -29,6 +32,136 @@ class GameSummary(BaseModel):
     gameId: str
     summary: str
     generatedAt: str
+
+# Cache directory
+CACHE_DIR = Path(__file__).parent / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Helper functions for caching and data transformation
+def fetch_scoreboard_data() -> Dict[str, Any]:
+    """Fetches today's scoreboard data with caching"""
+    cache_file = CACHE_DIR / "scoreboard_today.json"
+    
+    # Check if cached data exists
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error reading cache file: {e}")
+    
+    # Fetch from API
+    try:
+        scoreboard_obj = scoreboard.ScoreBoard()
+        data = scoreboard_obj.get_dict()
+        
+        # Save to cache
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except IOError as e:
+            print(f"Error writing cache file: {e}")
+        
+        return data
+    except Exception as e:
+        # If API call fails and we have cached data, try to use it
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scoreboard data: {str(e)}")
+
+def fetch_boxscore_data(game_id: str) -> Dict[str, Any]:
+    """Fetches boxscore data for a specific game with caching"""
+    cache_file = CACHE_DIR / f"boxscore_{game_id}.json"
+    
+    # Check if cached data exists
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error reading cache file: {e}")
+    
+    # Fetch from API
+    try:
+        boxscore_obj = boxscore.BoxScore(game_id)
+        data = boxscore_obj.get_dict()
+        
+        # Save to cache
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except IOError as e:
+            print(f"Error writing cache file: {e}")
+        
+        return data
+    except Exception as e:
+        # If API call fails and we have cached data, try to use it
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to fetch boxscore data for game {game_id}: {str(e)}")
+
+def transform_scoreboard_to_games(scoreboard_data: Dict[str, Any]) -> List[Game]:
+    """Transforms NBA API scoreboard response to Game models"""
+    games = []
+    
+    if "scoreboard" not in scoreboard_data or "games" not in scoreboard_data["scoreboard"]:
+        return games
+    
+    game_date = scoreboard_data["scoreboard"].get("gameDate", "")
+    # Format date from YYYY-MM-DD to "Month DD, YYYY"
+    try:
+        date_obj = datetime.strptime(game_date, "%Y-%m-%d")
+        formatted_date = date_obj.strftime("%B %d, %Y")
+    except:
+        formatted_date = game_date
+    
+    for game_data in scoreboard_data["scoreboard"]["games"]:
+        game_id = game_data.get("gameId", "")
+        game_status = game_data.get("gameStatus", 1)
+        
+        # Map gameStatus: 1 = scheduled, 2 = in progress, 3 = finished
+        status_map = {
+            1: "scheduled",
+            2: "in_progress",
+            3: "finished"
+        }
+        status = status_map.get(game_status, "scheduled")
+        
+        home_team = game_data.get("homeTeam", {})
+        away_team = game_data.get("awayTeam", {})
+        
+        home_team_name = home_team.get("teamName", "")
+        away_team_name = away_team.get("teamName", "")
+        
+        # Get scores (may be 0 for scheduled games)
+        home_score = home_team.get("score", 0)
+        away_score = away_team.get("score", 0)
+        
+        # For scheduled games, set scores to None
+        # For finished/in_progress games, use the actual scores
+        if status == "scheduled":
+            home_score = None
+            away_score = None
+        
+        games.append(Game(
+            id=game_id,
+            awayTeam=away_team_name,
+            homeTeam=home_team_name,
+            awayScore=away_score,
+            homeScore=home_score,
+            date=formatted_date,
+            status=status
+        ))
+    
+    return games
 
 # Mock data for today's games
 def get_todays_games() -> List[Game]:
@@ -109,15 +242,34 @@ def read_root():
 @app.get("/games/today", response_model=List[Game])
 def get_games_today():
     """Returns a list of today's NBA games"""
-    return get_todays_games()
+    try:
+        scoreboard_data = fetch_scoreboard_data()
+        games = transform_scoreboard_to_games(scoreboard_data)
+        return games
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching games: {str(e)}")
 
 @app.get("/games/{game_id}/summary", response_model=GameSummary)
 def get_game_summary(game_id: str):
     """Returns the LLM-generated summary for a specific game"""
-    if game_id not in MOCK_SUMMARIES:
-        raise HTTPException(status_code=404, detail=f"Summary not found for game {game_id}")
-    
-    return MOCK_SUMMARIES[game_id]
+    # For now, we fetch boxscore data to verify the game exists
+    # The actual summary generation will be implemented later
+    try:
+        boxscore_data = fetch_boxscore_data(game_id)
+        
+        # Check if we have a cached summary
+        if game_id in MOCK_SUMMARIES:
+            return MOCK_SUMMARIES[game_id]
+        
+        # If no summary exists yet, return a placeholder
+        # In the future, this will trigger LLM summary generation
+        raise HTTPException(status_code=404, detail=f"Summary not found for game {game_id}. Boxscore data fetched successfully, but summary generation is not yet implemented.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching game summary: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

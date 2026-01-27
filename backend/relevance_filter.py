@@ -4,7 +4,7 @@ Extracts key statistics from game data to create focused LLM prompts.
 """
 
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 
 def determine_time_of_day(game_time_local: str) -> str:
@@ -67,7 +67,7 @@ def extract_team_statistics(team_data: Dict[str, Any], team_type: str) -> List[s
     # Rebounds breakdown
     rebounds_offensive = team_stats.get('reboundsOffensive', 0)
     rebounds_defensive = team_stats.get('reboundsDefensive', 0)
-    rebounds_total = team_stats.get('reboundsTotal', 0)
+    rebounds_total = rebounds_offensive + rebounds_defensive
     stats.append(f"{team_name} rebounds: {rebounds_total} total ({rebounds_offensive} offensive, {rebounds_defensive} defensive)")
     
     # Turnovers
@@ -95,6 +95,10 @@ def extract_team_statistics(team_data: Dict[str, Any], team_type: str) -> List[s
     points_from_turnovers = team_stats.get('pointsFromTurnovers', 0)
     if points_from_turnovers >= 15:
         stats.append(f"{team_name} points off turnovers: {points_from_turnovers}")
+
+    scoring_leader, highest_points = get_scoring_leader(team_data.get('players', []))
+    if scoring_leader:
+        stats.append(f"{team_name} scoring leader: {scoring_leader} with {highest_points} points")
     
     return stats
 
@@ -247,3 +251,21 @@ def generate_llm_prompt_from_file(json_file_path: str, tone: str = "neutral, ESP
         game_data = json.load(f)
     
     return generate_llm_prompt(game_data, tone)
+
+def get_scoring_leader(players: List[Dict[str, Any]]) -> Tuple[str, int]:
+    """
+    Gets the scoring leader for a team.
+    
+    Args:
+        team_stats: Team data dictionary from the game JSON
+    
+    Returns:
+        Tuple of the scoring leader and highest points
+    """
+    highest_points = 0
+    scoring_leader = ''
+    for player in players:
+        if player.get('statistics', {}).get('points', 0) > highest_points:
+            highest_points = player.get('statistics', {}).get('points', 0)
+            scoring_leader = player.get('name', '')
+    return scoring_leader, highest_points

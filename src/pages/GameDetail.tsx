@@ -5,7 +5,40 @@ type GameSummary = {
   gameId: string;
   summary: string;
   generatedAt: string;
+  awayTeamId: number | null;
+  homeTeamId: number | null;
+  awayTeam: string | null;
+  homeTeam: string | null;
 };
+
+function getLogoUrl(teamId: number | null): string {
+  if (!teamId) return "";
+  return `https://cdn.nba.com/logos/nba/${teamId}/global/L/logo.svg`;
+}
+
+function TeamLogo({ teamId, teamName }: { teamId: number | null; teamName: string }) {
+  if (!teamId) return <span>{teamName}</span>;
+  
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+      <img
+        src={getLogoUrl(teamId)}
+        alt={`${teamName} logo`}
+        loading="lazy"
+        style={{
+          width: "32px",
+          height: "32px",
+          objectFit: "contain",
+        }}
+        onError={(e) => {
+          // Fallback: hide image if it fails to load
+          e.currentTarget.style.display = "none";
+        }}
+      />
+      <span>{teamName}</span>
+    </div>
+  );
+}
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -93,6 +126,25 @@ function GameDetail() {
         ← Back to Dashboard
       </Link>
       <h2>Game Summary</h2>
+      {(summary.awayTeam || summary.homeTeam) && (
+        <div style={{ 
+          display: "flex", 
+          alignItems: "center", 
+          gap: "1rem", 
+          marginTop: "1rem",
+          marginBottom: "1.5rem",
+          paddingBottom: "1rem",
+          borderBottom: "1px solid #e0e0e0"
+        }}>
+          {summary.awayTeam && (
+            <TeamLogo teamId={summary.awayTeamId} teamName={summary.awayTeam} />
+          )}
+          <span style={{ fontSize: "1.2rem", fontWeight: "500" }}>vs</span>
+          {summary.homeTeam && (
+            <TeamLogo teamId={summary.homeTeamId} teamName={summary.homeTeam} />
+          )}
+        </div>
+      )}
       <div style={{ marginTop: "1.5rem" }}>
         <p style={{ 
           fontSize: "1.1rem", 

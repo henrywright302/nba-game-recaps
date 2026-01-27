@@ -23,6 +23,8 @@ class Game(BaseModel):
     id: str
     awayTeam: str
     homeTeam: str
+    awayTeamId: Optional[int] = None
+    homeTeamId: Optional[int] = None
     awayScore: Optional[int] = None
     homeScore: Optional[int] = None
     date: str
@@ -32,6 +34,10 @@ class GameSummary(BaseModel):
     gameId: str
     summary: str
     generatedAt: str
+    awayTeamId: Optional[int] = None
+    homeTeamId: Optional[int] = None
+    awayTeam: Optional[str] = None
+    homeTeam: Optional[str] = None
 
 # Cache directory
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -140,6 +146,8 @@ def transform_scoreboard_to_games(scoreboard_data: Dict[str, Any]) -> List[Game]
         
         home_team_name = home_team.get("teamName", "")
         away_team_name = away_team.get("teamName", "")
+        home_team_id = home_team.get("teamId")
+        away_team_id = away_team.get("teamId")
         
         # Get scores (may be 0 for scheduled games)
         home_score = home_team.get("score", 0)
@@ -155,6 +163,8 @@ def transform_scoreboard_to_games(scoreboard_data: Dict[str, Any]) -> List[Game]
             id=game_id,
             awayTeam=away_team_name,
             homeTeam=home_team_name,
+            awayTeamId=away_team_id,
+            homeTeamId=home_team_id,
             awayScore=away_score,
             homeScore=home_score,
             date=formatted_date,
@@ -259,9 +269,31 @@ def get_game_summary(game_id: str):
     try:
         boxscore_data = fetch_boxscore_data(game_id)
         
+        # Extract team info from boxscore data
+        home_team_id = None
+        away_team_id = None
+        home_team_name = None
+        away_team_name = None
+        if "game" in boxscore_data:
+            game_data = boxscore_data["game"]
+            if "homeTeam" in game_data:
+                home_team = game_data["homeTeam"]
+                home_team_id = home_team.get("teamId")
+                home_team_name = home_team.get("teamName")
+            if "awayTeam" in game_data:
+                away_team = game_data["awayTeam"]
+                away_team_id = away_team.get("teamId")
+                away_team_name = away_team.get("teamName")
+        
         # Check if we have a cached summary
         if game_id in MOCK_SUMMARIES:
-            return MOCK_SUMMARIES[game_id]
+            summary = MOCK_SUMMARIES[game_id]
+            # Add team info to the summary
+            summary.awayTeamId = away_team_id
+            summary.homeTeamId = home_team_id
+            summary.awayTeam = away_team_name
+            summary.homeTeam = home_team_name
+            return summary
         
         # If no summary exists yet, return a placeholder
         # In the future, this will trigger LLM summary generation

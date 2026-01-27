@@ -6,11 +6,42 @@ type Game = {
   id: string;
   awayTeam: string;
   homeTeam: string;
+  awayTeamId: number | null;
+  homeTeamId: number | null;
   awayScore: number | null;
   homeScore: number | null;
   date: string;
   status: string;
 };
+
+function getLogoUrl(teamId: number | null): string {
+  if (!teamId) return "";
+  return `https://cdn.nba.com/logos/nba/${teamId}/global/L/logo.svg`;
+}
+
+function TeamLogo({ teamId, teamName }: { teamId: number | null; teamName: string }) {
+  if (!teamId) return <span className="team-name">{teamName}</span>;
+  
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+      <img
+        src={getLogoUrl(teamId)}
+        alt={`${teamName} logo`}
+        loading="lazy"
+        style={{
+          width: "24px",
+          height: "24px",
+          objectFit: "contain",
+        }}
+        onError={(e) => {
+          // Fallback: hide image if it fails to load
+          e.currentTarget.style.display = "none";
+        }}
+      />
+      <span className="team-name">{teamName}</span>
+    </div>
+  );
+}
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -95,13 +126,13 @@ export default function Dashboard() {
             <div className="game-card-content">
               <div className="game-teams">
                 <div className="team-row">
-                  <span className="team-name">{game.awayTeam}</span>
+                  <TeamLogo teamId={game.awayTeamId} teamName={game.awayTeam} />
                   <span className="team-score">
                     {game.awayScore !== null ? game.awayScore : "-"}
                   </span>
                 </div>
                 <div className="team-row">
-                  <span className="team-name">{game.homeTeam}</span>
+                  <TeamLogo teamId={game.homeTeamId} teamName={game.homeTeam} />
                   <span className="team-score">
                     {game.homeScore !== null ? game.homeScore : "-"}
                   </span>

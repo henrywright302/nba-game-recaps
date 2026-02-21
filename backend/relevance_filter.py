@@ -224,12 +224,13 @@ def generate_llm_prompt(game_data: Dict[str, Any], tone: str = "neutral, ESPN-st
     # Format statistics as bullet points
     facts_section = "\n".join([f"- {stat}" for stat in relevant_stats])
     
-    prompt = f"""Write a professional NBA recap paragraph.
+    prompt = f"""Write a professional NBA recap in 3–4 sentences. Use only the facts below; do not speculate or add information not given.
 
 Facts:
 {facts_section}
 
-Tone: {tone}"""
+Tone: {tone}
+Output: A single paragraph only, no bullet points or headers."""
     
     return prompt
 

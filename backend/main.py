@@ -1,11 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pydantic import BaseModel
 import json
+import time
 from pathlib import Path
+from math import ceil
 from nba_api.live.nba.endpoints import scoreboard, boxscore
+
+from relevance_filter import generate_llm_prompt
+from llm_service import (
+    load_cached_summary,
+    save_cached_summary,
+    generate_summary as llm_generate_summary,
+    validate_api_key,
+)
 
 app = FastAPI(title="NBA Game Recaps API")
 
@@ -43,20 +53,26 @@ class GameSummary(BaseModel):
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+REFRESH_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
+SCOREBOARD_REFRESHED_AT_FILE = CACHE_DIR / "scoreboard_today_refreshed_at.txt"
+
 # Helper functions for caching and data transformation
 def fetch_scoreboard_data() -> Dict[str, Any]:
-    """Fetches today's scoreboard data with caching"""
+    """Fetches today's scoreboard data with caching. Use GET /games/today/refresh to overwrite cache."""
     cache_file = CACHE_DIR / "scoreboard_today.json"
-    
-    # Check if cached data exists
+    today = datetime.now().strftime("%Y-%m-%d")
+
     if cache_file.exists():
         try:
             with open(cache_file, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+            cached_date = data.get("scoreboard", {}).get("gameDate")
+            if cached_date == today:
+                return data
         except (json.JSONDecodeError, IOError) as e:
             print(f"Error reading cache file: {e}")
-    
-    # Fetch from API
+
+    # Fetch from API (cache miss or wrong date)
     try:
         scoreboard_obj = scoreboard.ScoreBoard()
         data = scoreboard_obj.get_dict()
@@ -70,14 +86,90 @@ def fetch_scoreboard_data() -> Dict[str, Any]:
         
         return data
     except Exception as e:
-        # If API call fails and we have cached data, try to use it
         if cache_file.exists():
             try:
                 with open(cache_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to fetch scoreboard data: {str(e)}")
+
+
+SUMMARY_CACHE_DIR = CACHE_DIR / "summaries"
+
+def _game_from_boxscore_data(data: Dict[str, Any]) -> Optional[Tuple[datetime, Game]]:
+    """Build a Game from boxscore dict; returns None if missing required fields."""
+    status_map = {1: "scheduled", 2: "in_progress", 3: "finished"}
+    g = data.get("game") or {}
+    game_id = g.get("gameId")
+    if not game_id:
+        return None
+    ht = g.get("homeTeam") or {}
+    at = g.get("awayTeam") or {}
+    game_status = g.get("gameStatus", 3)
+    status = status_map.get(game_status, "finished")
+    game_time = g.get("gameTimeLocal") or g.get("gameEt") or ""
+    date_str = game_time[:10] if len(game_time) >= 10 else ""
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.min
+        formatted_date = date_obj.strftime("%B %d, %Y")
+    except Exception:
+        formatted_date = date_str or ""
+        date_obj = datetime.min
+    return (
+        date_obj,
+        Game(
+            id=game_id,
+            awayTeam=at.get("teamName", ""),
+            homeTeam=ht.get("teamName", ""),
+            awayTeamId=at.get("teamId"),
+            homeTeamId=ht.get("teamId"),
+            awayScore=at.get("score"),
+            homeScore=ht.get("score"),
+            date=formatted_date,
+            status=status,
+        ),
+    )
+
+
+def games_from_boxscore_cache() -> List[Game]:
+    """Build list of games from cached boxscore_*.json files (latest first). Uses only nba-api cache."""
+    entries: List[tuple] = []
+    for path in CACHE_DIR.glob("boxscore_*.json"):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        entry = _game_from_boxscore_data(data)
+        if entry:
+            entries.append(entry)
+    entries.sort(key=lambda x: x[0], reverse=True)
+    return [game for _, game in entries]
+
+
+def games_with_cached_summaries() -> List[Game]:
+    """Build list of games that have a cached summary (summary_*.json). Uses boxscore cache for details."""
+    entries: List[tuple] = []
+    SUMMARY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in SUMMARY_CACHE_DIR.glob("summary_*.json"):
+        game_id = path.stem.replace("summary_", "", 1)
+        if not game_id:
+            continue
+        boxscore_path = CACHE_DIR / f"boxscore_{game_id}.json"
+        if not boxscore_path.exists():
+            continue
+        try:
+            with open(boxscore_path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        entry = _game_from_boxscore_data(data)
+        if entry:
+            entries.append(entry)
+    entries.sort(key=lambda x: x[0], reverse=True)
+    return [game for _, game in entries]
+
 
 def fetch_boxscore_data(game_id: str) -> Dict[str, Any]:
     """Fetches boxscore data for a specific game with caching"""
@@ -251,7 +343,7 @@ def read_root():
 
 @app.get("/games/today", response_model=List[Game])
 def get_games_today():
-    """Returns a list of today's NBA games"""
+    """Returns a list of today's NBA games (from cache)."""
     try:
         scoreboard_data = fetch_scoreboard_data()
         games = transform_scoreboard_to_games(scoreboard_data)
@@ -261,47 +353,158 @@ def get_games_today():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching games: {str(e)}")
 
+
+@app.get("/games/today/refresh")
+def refresh_games_today():
+    """Calls NBA scoreboard again and overwrites today's cache. 30-minute cooldown between refreshes."""
+    from fastapi.responses import JSONResponse
+
+    now = time.time()
+    if SCOREBOARD_REFRESHED_AT_FILE.exists():
+        try:
+            last = float(SCOREBOARD_REFRESHED_AT_FILE.read_text().strip())
+            elapsed = now - last
+            if elapsed < REFRESH_COOLDOWN_SECONDS:
+                seconds_left = int(REFRESH_COOLDOWN_SECONDS - elapsed)
+                minutes_left = ceil(seconds_left / 60)
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": f"Refresh on cooldown. Try again in {minutes_left} minute(s).",
+                        "retryAfterSeconds": seconds_left,
+                    },
+                    headers={"Retry-After": str(seconds_left)},
+                )
+        except (ValueError, OSError):
+            pass
+
+    cache_file = CACHE_DIR / "scoreboard_today.json"
+    try:
+        scoreboard_obj = scoreboard.ScoreBoard()
+        data = scoreboard_obj.get_dict()
+        with open(cache_file, "w") as f:
+            json.dump(data, f, indent=2)
+        SCOREBOARD_REFRESHED_AT_FILE.write_text(str(now))
+        return transform_scoreboard_to_games(data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh scoreboard: {str(e)}")
+
+
+@app.get("/games/previous", response_model=List[Game])
+def get_games_previous():
+    """Returns only games that have a cached summary (summary_*.json). Uses boxscore cache for details."""
+    try:
+        return games_with_cached_summaries()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading previous games: {str(e)}")
+
+
+def _extract_team_info(boxscore_data: Dict[str, Any]) -> tuple:
+    """Extract home/away team ids and names from boxscore. Returns (away_*, home_*)."""
+    home_team_id = away_team_id = home_team_name = away_team_name = None
+    if "game" not in boxscore_data:
+        return away_team_id, away_team_name, home_team_id, home_team_name
+    game_data = boxscore_data["game"]
+    if "homeTeam" in game_data:
+        ht = game_data["homeTeam"]
+        home_team_id = ht.get("teamId")
+        home_team_name = ht.get("teamName")
+    if "awayTeam" in game_data:
+        at = game_data["awayTeam"]
+        away_team_id = at.get("teamId")
+        away_team_name = at.get("teamName")
+    return away_team_id, away_team_name, home_team_id, home_team_name
+
+
+def _cached_to_game_summary(cached: Dict[str, Any]) -> GameSummary:
+    """Build GameSummary from cached summary dict."""
+    return GameSummary(
+        gameId=cached.get("gameId", ""),
+        summary=cached["summary"],
+        generatedAt=cached.get("generatedAt", ""),
+        awayTeamId=cached.get("awayTeamId"),
+        homeTeamId=cached.get("homeTeamId"),
+        awayTeam=cached.get("awayTeam"),
+        homeTeam=cached.get("homeTeam"),
+    )
+
+
 @app.get("/games/{game_id}/summary", response_model=GameSummary)
 def get_game_summary(game_id: str):
-    """Returns the LLM-generated summary for a specific game"""
-    # For now, we fetch boxscore data to verify the game exists
-    # The actual summary generation will be implemented later
+    """Returns the LLM-generated summary for a specific game. Cached forever; no regeneration."""
     try:
-        boxscore_data = fetch_boxscore_data(game_id)
-        
-        # Extract team info from boxscore data
-        home_team_id = None
-        away_team_id = None
-        home_team_name = None
-        away_team_name = None
-        if "game" in boxscore_data:
-            game_data = boxscore_data["game"]
-            if "homeTeam" in game_data:
-                home_team = game_data["homeTeam"]
-                home_team_id = home_team.get("teamId")
-                home_team_name = home_team.get("teamName")
-            if "awayTeam" in game_data:
-                away_team = game_data["awayTeam"]
-                away_team_id = away_team.get("teamId")
-                away_team_name = away_team.get("teamName")
-        
-        # Check if we have a cached summary
+        # 1. Check file cache first (forever cache)
+        cached = load_cached_summary(game_id)
+        if cached:
+            return _cached_to_game_summary(cached)
+
+        # 2. Legacy mock summaries
         if game_id in MOCK_SUMMARIES:
+            boxscore_data = fetch_boxscore_data(game_id)
+            away_team_id, away_team_name, home_team_id, home_team_name = _extract_team_info(boxscore_data)
             summary = MOCK_SUMMARIES[game_id]
-            # Add team info to the summary
             summary.awayTeamId = away_team_id
             summary.homeTeamId = home_team_id
             summary.awayTeam = away_team_name
             summary.homeTeam = home_team_name
             return summary
-        
-        # If no summary exists yet, return a placeholder
-        # In the future, this will trigger LLM summary generation
-        raise HTTPException(status_code=404, detail=f"Summary not found for game {game_id}. Boxscore data fetched successfully, but summary generation is not yet implemented.")
+
+        # 3. Fetch boxscore and generate via LLM (then cache forever)
+        boxscore_data = fetch_boxscore_data(game_id)
+        away_team_id, away_team_name, home_team_id, home_team_name = _extract_team_info(boxscore_data)
+
+        game_data = boxscore_data.get("game", {})
+        game_status = game_data.get("gameStatus")
+        if game_status != 3:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Summary only available for finished games. Game {game_id} status is not final.",
+            )
+
+        if not validate_api_key():
+            raise HTTPException(
+                status_code=503,
+                detail="Summary generation is not configured. Set OPENAI_API_KEY in backend/.env (see .env.example).",
+            )
+
+        prompt = generate_llm_prompt(boxscore_data)
+        summary_text, prompt_tokens, completion_tokens = llm_generate_summary(prompt)
+        generated_at = datetime.utcnow().isoformat() + "Z"
+
+        save_cached_summary(
+            game_id=game_id,
+            summary=summary_text,
+            generated_at=generated_at,
+            away_team_id=away_team_id,
+            home_team_id=home_team_id,
+            away_team=away_team_name,
+            home_team=home_team_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        return GameSummary(
+            gameId=game_id,
+            summary=summary_text,
+            generatedAt=generated_at,
+            awayTeamId=away_team_id,
+            homeTeamId=home_team_id,
+            awayTeam=away_team_name,
+            homeTeam=home_team_name,
+        )
     except HTTPException:
         raise
+    except ValueError as e:
+        if "OPENAI_API_KEY" in str(e):
+            raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching game summary: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        detail = str(e) if str(e) else "Summary generation temporarily unavailable. Please try again later."
+        raise HTTPException(status_code=503, detail=detail)
 
 if __name__ == "__main__":
     import uvicorn

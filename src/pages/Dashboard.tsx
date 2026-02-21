@@ -45,32 +45,77 @@ function TeamLogo({ teamId, teamName }: { teamId: number | null; teamName: strin
 
 const API_BASE_URL = "http://localhost:8000";
 
+type Tab = "previous" | "today";
+
 export default function Dashboard() {
+  const [tab, setTab] = useState<Tab>("previous");
   const [games, setGames] = useState<Game[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshCooldownSeconds, setRefreshCooldownSeconds] = useState(0);
+
+  const fetchGames = async () => {
+    const endpoint =
+      tab === "previous"
+        ? `${API_BASE_URL}/games/previous`
+        : `${API_BASE_URL}/games/today`;
+    try {
+      setLoading(true);
+      setError(null);
+      const response = await fetch(endpoint);
+      if (!response.ok) {
+        throw new Error("Failed to fetch games");
+      }
+      const data = await response.json();
+      setGames(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "An error occurred");
+      console.error("Error fetching games:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshTodayScores = async () => {
+    if (refreshCooldownSeconds > 0) return;
+    setRefreshError(null);
+    setRefreshing(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/games/today/refresh`);
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = (body as { detail?: string }).detail ?? "Failed to refresh";
+        const retryAfter = (body as { retryAfterSeconds?: number }).retryAfterSeconds;
+        setRefreshError(detail);
+        if (response.status === 429 && typeof retryAfter === "number") {
+          setRefreshCooldownSeconds(Math.max(1, retryAfter));
+        }
+        return;
+      }
+      setGames(body);
+      setRefreshCooldownSeconds(0);
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : "An error occurred");
+      console.error("Error refreshing scores:", err);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   useEffect(() => {
-    const fetchGames = async () => {
-      try {
-        setLoading(true);
-        const response = await fetch(`${API_BASE_URL}/games/today`);
-        if (!response.ok) {
-          throw new Error("Failed to fetch games");
-        }
-        const data = await response.json();
-        setGames(data);
-        setError(null);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "An error occurred");
-        console.error("Error fetching games:", err);
-      } finally {
-        setLoading(false);
-      }
-    };
-
+    setRefreshError(null);
     fetchGames();
-  }, []);
+  }, [tab]);
+
+  useEffect(() => {
+    if (refreshCooldownSeconds <= 0) return;
+    const id = setInterval(() => {
+      setRefreshCooldownSeconds((s) => (s <= 1 ? 0 : s - 1));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [refreshCooldownSeconds]);
 
   if (loading) {
     return (
@@ -112,9 +157,49 @@ export default function Dashboard() {
       <header className="dashboard-header">
         <h1>NBA Game Recaps</h1>
         <p className="dashboard-subtitle">
-          Browse recent game recaps and highlights
+          Catch up with quick recaps from last night
         </p>
       </header>
+
+      <div className="dashboard-tabs-row">
+        <nav className="dashboard-tabs" aria-label="Switch date">
+          <button
+            type="button"
+            className={`dashboard-tab ${tab === "previous" ? "dashboard-tab-active" : ""}`}
+            onClick={() => setTab("previous")}
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            className={`dashboard-tab ${tab === "today" ? "dashboard-tab-active" : ""}`}
+            onClick={() => setTab("today")}
+          >
+            Today
+          </button>
+        </nav>
+        {tab === "today" && (
+          <div className="dashboard-refresh-wrap">
+            <button
+              type="button"
+              className="dashboard-refresh"
+              onClick={refreshTodayScores}
+              disabled={refreshing || refreshCooldownSeconds > 0}
+            >
+              {refreshing
+                ? "Refreshing..."
+                : refreshCooldownSeconds > 0
+                  ? `Refresh in ${Math.ceil(refreshCooldownSeconds / 60)} min`
+                  : "Refresh scores"}
+            </button>
+            {refreshError && (
+              <p className="dashboard-refresh-error" role="alert">
+                {refreshError}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="games-grid">
         {games.map((game) => (
